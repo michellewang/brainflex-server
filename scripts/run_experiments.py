@@ -42,10 +42,23 @@ DEFAULT_FEDPROX_MU = 1.0
 DEFAULT_ALPHA = 0.1
 
 
+def _load_training_plan_class(
+    module_name: str, class_name: str
+) -> type[BaseTrainingPlan]:
+    spec = importlib.util.spec_from_file_location(
+        f"training_plans.{module_name}",
+        DPATH_TRAINING_PLANS / f"{module_name}.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    # registered so that Fed-BioMed can get the source code to send to nodes
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return getattr(module, class_name)
+
+
 @dataclass(frozen=True)
 class TaskConfig:
-    training_plan_module: str
-    training_plan_class: str
+    training_plan_class: type[BaseTrainingPlan]
     target_column: str
     # whether the model intercept is initialized to the global target mean
     with_target_mean: bool = False
@@ -92,23 +105,19 @@ class PathHelper:
 
 TASKS = {
     "age": TaskConfig(
-        training_plan_module="tabular_regressor",
-        training_plan_class="TabularRegressorTrainingPlan",
+        training_plan_class=_load_training_plan_class(
+            "tabular_regressor", "TabularRegressorTrainingPlan"
+        ),
         target_column="nb:Age",
         with_target_mean=True,
-        extra_model_args={
-            "metrics": ["MEAN_SQUARE_ERROR", "MEAN_ABSOLUTE_ERROR", "R2"]
-        },
         secagg_clipping_range=100,
     ),
     "sex": TaskConfig(
-        training_plan_module="tabular_classifier",
-        training_plan_class="TabularClassifierTrainingPlan",
+        training_plan_class=_load_training_plan_class(
+            "tabular_classifier", "TabularClassifierTrainingPlan"
+        ),
         target_column="nb:Sex",
-        extra_model_args={
-            "n_classes": 2,
-            "metrics": ["ACCURACY", "BALANCED_ACCURACY", "AUROC"],
-        },
+        extra_model_args={"n_classes": 2},
     ),
 }
 
@@ -261,18 +270,6 @@ def _save_json(fpath: Path, data: dict) -> None:
     )
 
 
-def _load_training_plan_class(module_name: str, class_name: str) -> type:
-    spec = importlib.util.spec_from_file_location(
-        f"training_plans.{module_name}",
-        DPATH_TRAINING_PLANS / f"{module_name}.py",
-    )
-    module = importlib.util.module_from_spec(spec)
-    # registered so that Fed-BioMed can get the source code to send to nodes
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return getattr(module, class_name)
-
-
 def _get_node_data(task: str) -> dict[str, dict]:
     """Get the dataset metadata of each node that has data for a task."""
     fds = Experiment(tags=[COMMON_TAG, task]).training_data()
@@ -345,6 +342,8 @@ def _build_model_args(
         "feature_std": std,
         "target_column": config.target_column,
         "alpha": alpha,
+        # all the metrics supported by the training plan
+        "metrics": list(config.training_plan_class.METRICS),
         **config.extra_model_args,
     }
     if config.with_target_mean:
@@ -511,11 +510,7 @@ def _run_task(
     print(f"[{task}] Using {len(columns)} features")
     model_args = _build_model_args(task, columns, mean, std, alpha, target_mean)
     exp.set_model_args(model_args)
-    exp.set_training_plan_class(
-        _load_training_plan_class(
-            config.training_plan_module, config.training_plan_class
-        )
-    )
+    exp.set_training_plan_class(config.training_plan_class)
 
     # saved before training so that they are available even if training fails
     json_data = {
