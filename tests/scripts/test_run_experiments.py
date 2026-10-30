@@ -577,7 +577,8 @@ class TestRunTask:
         ]
         exp.set_model_args.assert_called_once_with(model_args)
         training_args = json_data["settings"]["training_args"]
-        assert training_args["test_metric"] == "MEAN_SQUARE_ERROR"
+        # the metrics are computed by the training plan testing_step
+        assert "test_metric" not in training_args
         # JSON object keys are strings
         assert json_data["results"] == json.loads(
             json.dumps(

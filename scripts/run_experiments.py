@@ -16,7 +16,6 @@ from pathlib import Path
 
 import numpy as np
 from declearn.optimizer.modules import ScaffoldServerModule
-from fedbiomed.common.metrics import MetricTypes
 from fedbiomed.common.optimizers.optimizer import Optimizer
 from fedbiomed.common.training_args import TrainingArgs
 from fedbiomed.common.training_plans import BaseTrainingPlan
@@ -48,7 +47,6 @@ class TaskConfig:
     training_plan_module: str
     training_plan_class: str
     target_column: str
-    test_metric: MetricTypes
     # whether the model intercept is initialized to the global target mean
     with_target_mean: bool = False
     extra_model_args: dict = field(default_factory=dict)
@@ -97,7 +95,6 @@ TASKS = {
         training_plan_module="tabular_regressor",
         training_plan_class="TabularRegressorTrainingPlan",
         target_column="nb:Age",
-        test_metric=MetricTypes.MEAN_SQUARE_ERROR,
         with_target_mean=True,
         secagg_clipping_range=100,
     ),
@@ -105,7 +102,6 @@ TASKS = {
         training_plan_module="tabular_classifier",
         training_plan_class="TabularClassifierTrainingPlan",
         target_column="nb:Sex",
-        test_metric=MetricTypes.ACCURACY,
         extra_model_args={"n_classes": 2},
     ),
 }
@@ -469,7 +465,6 @@ def _run_task(
             "loader_args": {"batch_size": batch_size},
             "num_updates": n_updates,
             "test_ratio": test_ratio,
-            "test_metric": config.test_metric,
             "test_on_global_updates": True,
             "test_on_local_updates": True,
             "optimizer_args": _build_optimizer_args(

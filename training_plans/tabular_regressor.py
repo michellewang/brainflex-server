@@ -7,6 +7,7 @@ from fedbiomed.common.datamanager import DataManager
 from fedbiomed.common.dataset import TabularDataset
 from fedbiomed.common.optimizers.optimizer import Optimizer
 from fedbiomed.common.training_plans import FedSGDRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 
 class TabularRegressorTrainingPlan(FedSGDRegressor):
@@ -20,6 +21,7 @@ class TabularRegressorTrainingPlan(FedSGDRegressor):
             "from fedbiomed.common.optimizers.optimizer import Optimizer",
             "from declearn.optimizer.modules import ScaffoldClientModule",
             "from declearn.optimizer.regularizers import FedProxRegularizer",
+            "from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score",
         ]
 
     def init_optimizer(self, optimizer_args):
@@ -46,7 +48,8 @@ class TabularRegressorTrainingPlan(FedSGDRegressor):
     def set_data_loaders(self, train_data_loader, test_data_loader):
         if train_data_loader is None:
             # no training data when the node only tests the model
-            # used in held-out node validation            self.training_data_loader = None
+            # used in held-out node validation
+            self.training_data_loader = None
             self.testing_data_loader = test_data_loader
         else:
             super().set_data_loaders(train_data_loader, test_data_loader)
@@ -68,3 +71,12 @@ class TabularRegressorTrainingPlan(FedSGDRegressor):
             transform=lambda x: (x - mean) / std,
         )
         return DataManager(dataset=dataset, shuffle=True)
+
+    def testing_step(self, data, target):
+        target = np.ravel(target)
+        prediction = self.model().predict(data)
+        return {
+            "MEAN_SQUARE_ERROR": mean_squared_error(target, prediction),
+            "MEAN_ABSOLUTE_ERROR": mean_absolute_error(target, prediction),
+            "R2": r2_score(target, prediction),
+        }

@@ -124,3 +124,28 @@ class TestTabularRegressorTrainingPlan:
         plan.set_data_loaders(None, test_data_loader)
         assert plan.training_data_loader is None
         assert plan.testing_data_loader is test_data_loader
+
+    @pytest.mark.parametrize("use_source", [False, True])
+    def test_testing_step(
+        self,
+        plan_cls: type[BaseTrainingPlan],
+        model_args: dict,
+        from_source: Callable[[BaseTrainingPlan], type[BaseTrainingPlan]],
+        use_source: bool,
+    ):
+        plan = plan_cls()
+        if use_source:
+            plan = from_source(plan)()
+        plan.post_init(model_args, TrainingArgs({}, only_required=False))
+        plan.set_model_params(
+            {"coef_": np.array([1.0, 0.0]), "intercept_": np.array([0.0])}
+        )
+        # predictions: [1, 2, 3, 4]
+        data = np.array([[1.0, 5.0], [2.0, 5.0], [3.0, 5.0], [4.0, 5.0]])
+        target = np.array([[1.0], [2.0], [4.0], [5.0]])
+        metrics = plan.testing_step(data, target)
+        assert metrics.keys() == {"MEAN_SQUARE_ERROR", "MEAN_ABSOLUTE_ERROR", "R2"}
+        np.testing.assert_allclose(metrics["MEAN_SQUARE_ERROR"], 0.5)
+        np.testing.assert_allclose(metrics["MEAN_ABSOLUTE_ERROR"], 0.5)
+        # 1 - 2 / 10
+        np.testing.assert_allclose(metrics["R2"], 0.8)

@@ -7,6 +7,7 @@ from fedbiomed.common.datamanager import DataManager
 from fedbiomed.common.dataset import TabularDataset
 from fedbiomed.common.optimizers.optimizer import Optimizer
 from fedbiomed.common.training_plans import FedSGDClassifier
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, roc_auc_score
 
 
 class TabularClassifierTrainingPlan(FedSGDClassifier):
@@ -20,6 +21,8 @@ class TabularClassifierTrainingPlan(FedSGDClassifier):
             "from fedbiomed.common.optimizers.optimizer import Optimizer",
             "from declearn.optimizer.modules import ScaffoldClientModule",
             "from declearn.optimizer.regularizers import FedProxRegularizer",
+            "from sklearn.metrics import accuracy_score, balanced_accuracy_score",
+            "from sklearn.metrics import roc_auc_score",
         ]
 
     def init_optimizer(self, optimizer_args):
@@ -63,3 +66,17 @@ class TabularClassifierTrainingPlan(FedSGDClassifier):
             transform=lambda x: (x - mean) / std,
         )
         return DataManager(dataset=dataset, shuffle=True)
+
+    def testing_step(self, data, target):
+        target = np.ravel(target)
+        prediction = self.model().predict(data)
+        if len(np.unique(target)) < 2:
+            # AUROC is undefined if the split has a single class
+            auroc = float("nan")
+        else:
+            auroc = roc_auc_score(target, self.model().decision_function(data))
+        return {
+            "ACCURACY": accuracy_score(target, prediction),
+            "BALANCED_ACCURACY": balanced_accuracy_score(target, prediction),
+            "AUROC": auroc,
+        }
