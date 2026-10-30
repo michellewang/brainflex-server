@@ -96,13 +96,19 @@ TASKS = {
         training_plan_class="TabularRegressorTrainingPlan",
         target_column="nb:Age",
         with_target_mean=True,
+        extra_model_args={
+            "metrics": ["MEAN_SQUARE_ERROR", "MEAN_ABSOLUTE_ERROR", "R2"]
+        },
         secagg_clipping_range=100,
     ),
     "sex": TaskConfig(
         training_plan_module="tabular_classifier",
         training_plan_class="TabularClassifierTrainingPlan",
         target_column="nb:Sex",
-        extra_model_args={"n_classes": 2},
+        extra_model_args={
+            "n_classes": 2,
+            "metrics": ["ACCURACY", "BALANCED_ACCURACY", "AUROC"],
+        },
     ),
 }
 

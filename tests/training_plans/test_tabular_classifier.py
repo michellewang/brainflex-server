@@ -116,7 +116,11 @@ class TestTabularClassifierTrainingPlan:
         from_source: Callable[[BaseTrainingPlan], type[BaseTrainingPlan]],
         use_source: bool,
     ):
-        plan = _fitted_plan(plan_cls, model_args, from_source if use_source else None)
+        plan = _fitted_plan(
+            plan_cls,
+            model_args | {"metrics": list(plan_cls.METRICS)},
+            from_source if use_source else None,
+        )
         # decision scores: [-2, -1, 1, 2], predictions: [0, 0, 1, 1]
         data = np.array([[-2.0, 5.0], [-1.0, 5.0], [1.0, 5.0], [2.0, 5.0]])
         target = np.array([[0], [1], [1], [1]])
@@ -128,14 +132,39 @@ class TestTabularClassifierTrainingPlan:
         np.testing.assert_allclose(metrics["AUROC"], 1.0)
 
     @pytest.mark.filterwarnings("ignore:A single label was found")
+    @pytest.mark.filterwarnings("ignore:Only one class is present")
     def test_testing_step_single_class(
         self, plan_cls: type[BaseTrainingPlan], model_args: dict
     ):
-        plan = _fitted_plan(plan_cls, model_args)
+        plan = _fitted_plan(plan_cls, model_args | {"metrics": list(plan_cls.METRICS)})
         data = np.array([[1.0, 5.0], [2.0, 5.0]])
         metrics = plan.testing_step(data, np.array([[1], [1]]))
-        np.testing.assert_allclose(metrics["ACCURACY"], 1.0)
-        assert np.isnan(metrics["AUROC"])
+        assert metrics == {"ACCURACY": 1.0, "BALANCED_ACCURACY": 1.0}
+
+    def test_testing_step_default(
+        self, plan_cls: type[BaseTrainingPlan], model_args: dict
+    ):
+        plan = _fitted_plan(plan_cls, model_args)
+        # predictions: [0, 0, 1]
+        data = np.array([[-2.0, 5.0], [-1.0, 5.0], [1.0, 5.0]])
+        target = np.array([[0], [1], [1]])
+        metrics = plan.testing_step(data, target)
+        assert metrics.keys() == {"ACCURACY"}
+        np.testing.assert_allclose(metrics["ACCURACY"], 2 / 3)
+
+    def test_testing_step_metrics_arg(
+        self, plan_cls: type[BaseTrainingPlan], model_args: dict
+    ):
+        plan = _fitted_plan(plan_cls, model_args | {"metrics": ["AUROC"]})
+        data = np.array([[-1.0, 5.0], [1.0, 5.0]])
+        assert plan.testing_step(data, np.array([[0], [1]])) == {"AUROC": 1.0}
+
+    def test_unknown_metric(self, plan_cls: type[BaseTrainingPlan], model_args: dict):
+        with pytest.raises(ValueError, match="Unknown metrics"):
+            plan_cls().post_init(
+                model_args | {"metrics": ["AUROC", "F1"]},
+                TrainingArgs({}, only_required=False),
+            )
 
 
 def _fitted_plan(
