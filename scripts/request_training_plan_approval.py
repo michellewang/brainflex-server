@@ -5,15 +5,13 @@
 import argparse
 import sys
 
+from _tasks import COMMON_TAG, TASKS
 from fedbiomed.common.constants import TrainingPlanApprovalStatus
 from fedbiomed.researcher.federated_workflows import Experiment
 from fedbiomed.researcher.federated_workflows.jobs import (
     TrainingPlanApproveJob,
     TrainingPlanCheckJob,
 )
-
-# importable because the script's directory is the first entry of sys.path
-from run_experiments import COMMON_TAG, TASKS
 
 # Fed-BioMed-defined status of a training plan that a node doesn't know
 TRAINING_PLAN_NOT_REGISTERED = "Not Registered"

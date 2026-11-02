@@ -3,36 +3,36 @@
 """Run the federated learning experiments."""
 
 import argparse
-import importlib.util
 import json
 import math
 import shutil
 import sys
-import warnings
 from collections import defaultdict
-from dataclasses import dataclass, field
+from collections.abc import Generator
 from datetime import date
-from enum import Enum
 from pathlib import Path
 
-import numpy as np
+from _io_utils import (
+    PREFIX_LOGS,
+    PREFIX_MODEL,
+    PREFIX_RESULTS,
+    PREFIX_TENSORBOARD,
+    PathHelper,
+    save_json,
+)
+from _log_utils import log_to_file, logger, print_logger_messages_at_exit
+from _tasks import COMMON_TAG, TASKS, filter_feature_col
 from declearn.optimizer.modules import ScaffoldServerModule
 from fedbiomed.common.optimizers.optimizer import Optimizer
 from fedbiomed.common.training_args import TrainingArgs
-from fedbiomed.common.training_plans import BaseTrainingPlan
 from fedbiomed.researcher.datasets import FederatedDataset
 from fedbiomed.researcher.federated_workflows import Experiment, FederatedAnalytics
 from fedbiomed.researcher.federated_workflows.jobs import TrainingJob
 from fedbiomed.researcher.secagg import SecureAggregation
 
-DPATH_TRAINING_PLANS = Path(__file__).resolve().parents[1] / "training_plans"
-PREFIX_MODEL = "model"
-PREFIX_RESULTS = "results"
-PREFIX_TENSORBOARD = "tensorboard"
-COMMON_TAG = "brainflex"
-
 AGGREGATORS = ["fedavg", "fedprox", "scaffold"]
 
+DEFAULT_TASKS = ["age", "sex"]
 DEFAULT_N_ROUNDS = 30
 DEFAULT_BATCH_SIZE = 1000  # full batch
 DEFAULT_N_UPDATES = 50
@@ -41,88 +41,10 @@ DEFAULT_TEST_RATIO = 0.1
 DEFAULT_AGGREGATOR = "scaffold"
 DEFAULT_FEDPROX_MU = 1.0
 DEFAULT_ALPHA = 0.1
+DEFAULT_TENSORBOARD = True
+DEFAULT_SECAGG = True
+DEFAULT_CV = True
 DEFAULT_DATE_TAG = date.today().strftime("%Y_%m_%d")
-
-
-def _load_training_plan_class(
-    module_name: str, class_name: str
-) -> type[BaseTrainingPlan]:
-    spec = importlib.util.spec_from_file_location(
-        f"training_plans.{module_name}",
-        DPATH_TRAINING_PLANS / f"{module_name}.py",
-    )
-    module = importlib.util.module_from_spec(spec)
-    # registered so that Fed-BioMed can get the source code to send to nodes
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return getattr(module, class_name)
-
-
-@dataclass(frozen=True)
-class TaskConfig:
-    training_plan_class: type[BaseTrainingPlan]
-    target_column: str
-    # whether the model intercept is initialized to the global target mean
-    with_target_mean: bool = False
-    extra_model_args: dict = field(default_factory=dict)
-    # model parameters are clipped to [-x, x] before being encrypted for secure
-    # aggregation
-    secagg_clipping_range: int | None = None
-
-
-@dataclass(frozen=True)
-class PathHelper:
-    output_dir: Path
-    date_tag: str
-    n_rounds: int
-    batch_size: int
-    n_updates: int
-    learning_rate: float
-    test_ratio: float
-    aggregator: str
-    alpha: float
-
-    def get_fpath_out(
-        self,
-        task: str,
-        prefix: str,
-        extension: str = ".json",
-        held_out_node: str | None = None,
-    ) -> Path:
-        stem = "-".join(
-            [
-                prefix,
-                self.aggregator,
-                f"{self.n_rounds}rounds",
-                f"{self.n_updates}updates",
-                f"{self.batch_size}",
-                f"{self.learning_rate}lr",
-                f"{self.test_ratio}test",
-                f"{self.alpha}alpha",
-            ]
-        )
-        if held_out_node is not None:
-            stem = f"{stem}-heldout_{held_out_node}"
-        return self.output_dir / self.date_tag / task / f"{stem}{extension}"
-
-
-TASKS = {
-    "age": TaskConfig(
-        training_plan_class=_load_training_plan_class(
-            "tabular_regressor", "TabularRegressorTrainingPlan"
-        ),
-        target_column="nb:Age",
-        with_target_mean=True,
-        secagg_clipping_range=100,
-    ),
-    "sex": TaskConfig(
-        training_plan_class=_load_training_plan_class(
-            "tabular_classifier", "TabularClassifierTrainingPlan"
-        ),
-        target_column="nb:Sex",
-        extra_model_args={"n_classes": 2},
-    ),
-}
 
 
 def _get_parser() -> argparse.ArgumentParser:
@@ -142,7 +64,6 @@ def _get_parser() -> argparse.ArgumentParser:
         "--task",
         dest="tasks",
         action="append",
-        required=True,
         choices=list(TASKS),
         help="Task to run. Can be repeated.",
     )
@@ -195,90 +116,35 @@ def _get_parser() -> argparse.ArgumentParser:
         help=f"L2 regularization strength. Default: {DEFAULT_ALPHA}.",
     )
     parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Overwrite existing results.",
-    )
-    parser.add_argument(
         "--tensorboard",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Save node metrics as TensorBoard logs. Default: True.",
+        default=DEFAULT_TENSORBOARD,
+        help=f"Save node metrics as TensorBoard logs. Default: {DEFAULT_TENSORBOARD}.",
     )
     parser.add_argument(
         "--secagg",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=DEFAULT_SECAGG,
         help=(
             "Secure aggregation of the model parameters and the feature statistics."
-            " Needs at least 2 training nodes. Default: True."
+            f" Needs at least 2 training nodes. Default: {DEFAULT_SECAGG}."
         ),
     )
     parser.add_argument(
         "--cv",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=DEFAULT_CV,
         help=(
             "Leave-one-node-out cross-validation: train on all nodes but one and"
-            " evaluate on the held-out node. Default: True."
+            f" evaluate on the held-out node. Default: {DEFAULT_CV}."
         ),
     )
-    return parser
-
-
-def _filter_feature_col(col: str) -> bool:
-    if col.startswith("nb:"):
-        return True
-    elif col.endswith("_thickness"):
-        # return False
-        return not (
-            col
-            in [
-                # exclude these
-                "lh_MeanThickness_thickness",
-                "rh_MeanThickness_thickness",
-                "rh_temporalpole_thickness",
-            ]
-        )
-    else:
-        return col in [
-            # include these
-            "EstimatedTotalIntraCranialVol",
-            "Left-Lateral-Ventricle",
-            "Left-Thalamus",
-            "Left-Caudate",
-            "Left-Putamen",
-            "Left-Pallidum",
-            "Left-Hippocampus",
-            "Left-Amygdala",
-            "Left-Accumbens-area",
-            "Right-Lateral-Ventricle",
-            "Right-Thalamus",
-            "Right-Caudate",
-            "Right-Putamen",
-            "Right-Pallidum",
-            "Right-Hippocampus",
-            "Right-Amygdala",
-            "Right-Accumbens-area",
-        ]
-
-
-def _serialize(obj: object) -> object:
-    if isinstance(obj, Enum):
-        return obj.name
-    if isinstance(obj, Path):
-        return str(obj)
-    if isinstance(obj, (np.ndarray, np.generic)):
-        return obj.tolist()
-    if isinstance(obj, set):
-        return sorted(obj)
-    raise TypeError(f"Type {type(obj)} not serializable")
-
-
-def _save_json(fpath: Path, data: dict) -> None:
-    fpath.write_text(
-        json.dumps(data, indent=4, allow_nan=False, default=_serialize) + "\n"
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing results.",
     )
+    return parser
 
 
 def _get_node_data(task: str) -> dict[str, dict]:
@@ -304,7 +170,7 @@ def _get_feature_stats(
         excluded_columns["not in the datasets of all nodes"] = missing_columns
     stats_columns: list[str] = []
     for column in sorted(common_columns):
-        if column == target_column or _filter_feature_col(column):
+        if column == target_column or filter_feature_col(column):
             stats_columns.append(column)
         else:
             excluded_columns["not in feature column list"].append(column)
@@ -322,10 +188,6 @@ def _get_feature_stats(
             columns.append(column)
 
     columns = sorted(columns)
-
-    if excluded_columns:
-        for reason, cols in excluded_columns.items():
-            print(f"Excluding {len(cols)} features ({reason}): {cols}")
 
     # cast to float so that the model args are JSON-serializable
     return (
@@ -459,21 +321,27 @@ def _run_task(
     aggregator: str,
     fedprox_mu: float,
     alpha: float,
-    settings: dict,
-    fpath_results: Path,
     fpath_model: Path,
     dpath_tensorboard: Path | None = None,
     training_nodes: list[str] | None = None,
     node_data_held_out: dict[str, dict] | None = None,
     secagg: bool = True,
-) -> BaseTrainingPlan:
+) -> Generator[tuple[str, dict], None, None]:
     """Train a model for a task and save it in a task-specific output directory.
 
     If ``node_data_held_out`` is given, only ``training_nodes`` are used for training
     and the held-out node is used for testing.
+
+    Yields the fold key (the training nodes joined by ``__``) and the fold settings
+    and results. Saves the model and TensorBoard logs after the last yield.
     """
     config = TASKS[task]
     is_cv = node_data_held_out is not None
+    held_out_node = next(iter(node_data_held_out)) if is_cv else None
+    section_name = task.upper()
+    if is_cv:
+        section_name += f": held_out_node={held_out_node}"
+    logger.info(f"===== {section_name} =====")
     exp = Experiment(
         tags=[COMMON_TAG, task],
         nodes=training_nodes,
@@ -500,33 +368,34 @@ def _run_task(
         # redo the search to drop the held-out node
         # otherwise, it would be included in the federated analytics
         exp.set_training_data(None, from_tags=True)
+    fold_key = "__".join(sorted(exp.training_data().data()))
 
     if not is_cv:
-        warnings.warn(
-            "Feature z-scoring statistics are computed on all node data, including"
-            " the test data (data leakage). Use --cv to avoid this",
-            stacklevel=2,
+        logger.warning(
+            "Feature z-scoring statistics are computed on all node data,"
+            " including the test data (data leakage). Use --cv to avoid this"
         )
         if config.with_target_mean:
-            warnings.warn(
-                "The intercept is initialized with the target mean of all node data,"
-                " including the test data (data leakage). Use --cv to avoid this",
-                stacklevel=2,
+            logger.warning(
+                "The intercept is initialized with the target mean of all"
+                " node data, including the test data (data leakage). Use --cv to"
+                " avoid this"
             )
 
     # the training plan needs the feature stats to be instantiated
     columns, mean, std, excluded_columns, target_mean = _get_feature_stats(
         exp.analytics, exp.training_data().data(), config.target_column
     )
-    print(f"[{task}] Using {len(columns)} features")
+    for reason, cols in excluded_columns.items():
+        logger.info(f"Excluding {len(cols)} features ({reason}): {cols}")
+    logger.info(f"Using {len(columns)} features")
     model_args = _build_model_args(task, columns, mean, std, alpha, target_mean)
     exp.set_model_args(model_args)
     exp.set_training_plan_class(config.training_plan_class)
 
     # saved before training so that they are available even if training fails
-    json_data = {
+    fold = {
         "settings": {
-            "runtime_args": settings,
             "training_nodes": training_nodes,
             "held_out_node": node_data_held_out,
             "excluded_columns": excluded_columns,
@@ -534,8 +403,7 @@ def _run_task(
             "training_args": exp.training_args(),
         }
     }
-    fpath_results.parent.mkdir(parents=True, exist_ok=True)
-    _save_json(fpath_results, json_data)
+    yield fold_key, fold
 
     held_out_secagg_arguments = None
     if is_cv and secagg:
@@ -544,31 +412,29 @@ def _run_task(
         )
 
     for round_ in range(1, n_rounds + 1):
-        print(f"[{task}] Round {round_}/{n_rounds}")
+        logger.info(f"Round {round_}/{n_rounds}")
         if is_cv:
             _evaluate_held_out(exp, node_data_held_out, held_out_secagg_arguments)
         exp.run_once()
-        json_data["results"] = {
+        fold["results"] = {
             # node training losses and test metrics (no public getter)
             "node_metrics": exp.monitor()._metric_store,
             "training_replies": exp.save_training_replies(),
         }
-        _save_json(fpath_results, json_data)
+        yield fold_key, fold
     if is_cv:
         # final global model
         _evaluate_held_out(exp, node_data_held_out, held_out_secagg_arguments)
-        json_data["results"]["node_metrics"] = exp.monitor()._metric_store
-        _save_json(fpath_results, json_data)
-    print(f"[{task}] Saved settings and results to {fpath_results}")
+        fold["results"]["node_metrics"] = exp.monitor()._metric_store
+        yield fold_key, fold
 
     if dpath_tensorboard is not None:
         _move_tensorboard_logs(exp, dpath_tensorboard)
-        print(f"[{task}] Saved TensorBoard logs to {dpath_tensorboard}")
+        logger.info(f"Saved TensorBoard logs to {dpath_tensorboard}")
 
     fpath_model.parent.mkdir(parents=True, exist_ok=True)
     exp.training_plan().export_model(str(fpath_model))
-    print(f"[{task}] Saved global model to {fpath_model}")
-    return exp.training_plan()
+    logger.info(f"Saved global model to {fpath_model}")
 
 
 def run_experiments(
@@ -592,12 +458,12 @@ def run_experiments(
     output_dir = output_dir.resolve()
     settings = locals().copy()
 
-    # (task, held-out node) pairs, with None for no held-out node
-    runs: list[tuple[str, str | None]] = []
+    # held-out nodes for each task, with None for no held-out node
+    runs: dict[str, list[str | None]] = {}
     node_data: dict[str, dict[str, dict]] = {}
     for task in tasks:
         if not cv:
-            runs.append((task, None))
+            runs[task] = [None]
             continue
         node_data[task] = _get_node_data(task)
         # secure aggregation needs at least 2 training nodes
@@ -608,7 +474,7 @@ def run_experiments(
                 f"{' with secure aggregation' if secagg else ''},"
                 f" but {task} has {len(node_data[task])}"
             )
-        runs.extend((task, node) for node in sorted(node_data[task]))
+        runs[task] = sorted(node_data[task])
 
     path_helper = PathHelper(
         output_dir=output_dir,
@@ -619,19 +485,22 @@ def run_experiments(
         learning_rate=learning_rate,
         test_ratio=test_ratio,
         aggregator=aggregator,
+        fedprox_mu=fedprox_mu,
         alpha=alpha,
+        secagg=secagg,
+        cv=cv,
     )
 
     # error out if one of the result files already exists
     fpaths_results_existing = []
-    for task, held_out_node in runs:
+    for task in runs:
         fpath = path_helper.get_fpath_out(
-            task=task,
-            prefix=PREFIX_RESULTS,
-            extension=".json",
-            held_out_node=held_out_node,
+            task=task, prefix=PREFIX_RESULTS, extension=".json"
         )
-        if fpath.exists() and "results" in json.loads(fpath.read_text()):
+        if fpath.exists() and any(
+            "results" in fold
+            for fold in json.loads(fpath.read_text()).get("folds", {}).values()
+        ):
             fpaths_results_existing.append(fpath)
 
     if fpaths_results_existing and not overwrite:
@@ -640,53 +509,62 @@ def run_experiments(
             " Use --overwrite to overwrite them"
         )
 
-    for task, held_out_node in runs:
-        if held_out_node is None:
-            # use all nodes for training
-            training_nodes = None
-            node_data_held_out = None
-        else:
-            print(f"[{task}] Holding out node {held_out_node}")
-            training_nodes = sorted(set(node_data[task]) - {held_out_node})
-            node_data_held_out = {held_out_node: node_data[task][held_out_node]}
+    with print_logger_messages_at_exit():
+        for task, held_out_nodes in runs.items():
+            fpath_results = path_helper.get_fpath_out(
+                task=task, prefix=PREFIX_RESULTS, extension=".json"
+            )
+            fpath_log = path_helper.get_fpath_out(
+                task=task, prefix=PREFIX_LOGS, extension=".log"
+            )
+            json_data = {"settings": {"runtime_args": settings}, "folds": {}}
+            fpath_results.parent.mkdir(parents=True, exist_ok=True)
+            with log_to_file(fpath_log):
+                for held_out_node in held_out_nodes:
+                    if held_out_node is None:
+                        # use all nodes for training
+                        training_nodes = None
+                        node_data_held_out = None
+                    else:
+                        training_nodes = sorted(set(node_data[task]) - {held_out_node})
+                        node_data_held_out = {
+                            held_out_node: node_data[task][held_out_node]
+                        }
 
-        _run_task(
-            task=task,
-            n_rounds=n_rounds,
-            batch_size=batch_size,
-            n_updates=n_updates,
-            learning_rate=learning_rate,
-            test_ratio=test_ratio,
-            aggregator=aggregator,
-            fedprox_mu=fedprox_mu,
-            alpha=alpha,
-            settings=settings,
-            fpath_results=path_helper.get_fpath_out(
-                task=task,
-                prefix=PREFIX_RESULTS,
-                extension=".json",
-                held_out_node=held_out_node,
-            ),
-            fpath_model=path_helper.get_fpath_out(
-                task=task,
-                prefix=PREFIX_MODEL,
-                extension=".pkl",
-                held_out_node=held_out_node,
-            ),
-            dpath_tensorboard=(
-                path_helper.get_fpath_out(
-                    task=task,
-                    prefix=PREFIX_TENSORBOARD,
-                    extension="",
-                    held_out_node=held_out_node,
-                )
-                if tensorboard
-                else None
-            ),
-            training_nodes=training_nodes,
-            node_data_held_out=node_data_held_out,
-            secagg=secagg,
-        )
+                    for fold_key, fold in _run_task(
+                        task=task,
+                        n_rounds=n_rounds,
+                        batch_size=batch_size,
+                        n_updates=n_updates,
+                        learning_rate=learning_rate,
+                        test_ratio=test_ratio,
+                        aggregator=aggregator,
+                        fedprox_mu=fedprox_mu,
+                        alpha=alpha,
+                        fpath_model=path_helper.get_fpath_out(
+                            task=task,
+                            prefix=PREFIX_MODEL,
+                            extension=".pkl",
+                            held_out_node=held_out_node,
+                        ),
+                        dpath_tensorboard=(
+                            path_helper.get_fpath_out(
+                                task=task,
+                                prefix=PREFIX_TENSORBOARD,
+                                extension="",
+                                held_out_node=held_out_node,
+                            )
+                            if tensorboard
+                            else None
+                        ),
+                        training_nodes=training_nodes,
+                        node_data_held_out=node_data_held_out,
+                        secagg=secagg,
+                    ):
+                        json_data["folds"][fold_key] = fold
+                        save_json(fpath_results, json_data)
+                    logger.info(f"Saved settings and results to {fpath_results}")
+            logger.info(f"Saved log to {fpath_log}")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -694,7 +572,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         run_experiments(
             args.output_dir,
-            args.tasks,
+            args.tasks if args.tasks is not None else DEFAULT_TASKS,
             date_tag=args.date_tag,
             n_rounds=args.n_rounds,
             batch_size=args.batch_size,
