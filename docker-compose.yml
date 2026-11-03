@@ -11,23 +11,19 @@ services:
   vpn-server:
     container_name: brainflex-vpn-server-${FBM_CONTAINER_INSTANCE_ID:-default}
     hostname: brainflex-vpn-server-${FBM_CONTAINER_INSTANCE_ID:-default}
-    build:
-      context: https://github.com/neurodatascience/brainflex.git#main:docker/vpn-server
-      additional_contexts:
-        vpn-client: service:researcher-vpn # base image
-    image: brainflex/vpn-server:local
-    pull_policy: build
+    image: ghcr.io/neurodatascience/brainflex-vpn-server:0.1.0@sha256:29e6463ae5696478913ff0c0973729c10af426f6507ecdb27f6c0be38038a1fd
     cap_add:
       - net_admin # needed to handle wireguard interface
-      - sys_module # needed to remove wireguard kernel module
     devices:
       - /dev/net/tun # needed to handle wireguard interface
     sysctls:
       - net.ipv4.ip_forward=1 # relay traffic between VPN peers
+    environment:
+      - VPN_SERVER_PORT=${VPN_SERVER_PORT:-51820}
     volumes:
       - ./vpnserver_config:/config # contains VPN configurations
     ports:
-      - 51820:51820/udp # wireguard server
+      - ${VPN_SERVER_PORT:-51820}:${VPN_SERVER_PORT:-51820}/udp # wireguard server
     # separate network: clients on the same docker network cannot reach the
     # server through the host's published port
     networks:
@@ -42,13 +38,9 @@ services:
   researcher-vpn:
     container_name: brainflex-researcher-vpn-${FBM_CONTAINER_INSTANCE_ID:-default}
     hostname: brainflex-researcher-${FBM_CONTAINER_INSTANCE_ID:-default}
-    build:
-      context: https://github.com/neurodatascience/brainflex.git#main:docker/vpn-client
-    image: brainflex/vpn-client:local
-    pull_policy: build
+    image: ghcr.io/neurodatascience/brainflex-vpn-client:0.1.0@sha256:1c353258abde508771422e71384301aea88915b2f34bd2e236f3c8a9ab250de4
     cap_add:
       - net_admin # needed to handle wireguard interface
-      - sys_module # needed to remove wireguard kernel module
     devices:
       - /dev/net/tun # needed to handle wireguard interface
     volumes:
